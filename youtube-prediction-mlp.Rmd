@@ -1,0 +1,224 @@
+---
+title: "youtube-virality"
+author: "Griffin Cooper"
+date: "2025-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(torch)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(tibble)
+```
+
+
+```{r data preprocessing}
+# Load preprocessed metadata
+metadata <- read_csv("metadata_processed.csv")
+
+X <- metadata %>%
+  select(-video_id, -channelId, -title, -description, -publishedAt, -duration, -privacyStatus, -viewCount) %>%
+  select(where(is.numeric)) %>%
+  mutate(across(everything(), as.numeric))
+
+y <- log1p(metadata$viewCount)
+
+# Train/test split
+set.seed(42)
+train_idx <- sample(seq_len(nrow(X)), size = 0.8 * nrow(X))
+
+X_train <- X[train_idx, ] %>% as.matrix()
+X_test  <- X[-train_idx, ] %>% as.matrix()
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+
+```{r dataset}
+# Dataset class
+MLPDataset <- dataset(
+  name = "MLPDataset",
+  initialize = function(X, y) {
+    self$X <- X
+    self$y <- y
+  },
+  .getitem = function(i) {
+    list(x = torch_tensor(self$X[i, ], dtype = torch_float()),
+         y = torch_tensor(self$y[i], dtype = torch_float())$squeeze())
+  },
+  .length = function() {
+    nrow(self$X)
+  }
+)
+```
+
+```{r model}
+# MLP model
+MLPModel <- nn_module(
+  initialize = function(input_dim) {
+    self$model <- nn_sequential(
+      nn_linear(input_dim, 128),
+      nn_batch_norm1d(128),
+      nn_relu(),
+      nn_dropout(p = 0.2),
+    
+      nn_linear(128, 64),
+      nn_batch_norm1d(64),
+      nn_relu(),
+      nn_dropout(p = 0.2),
+    
+      nn_linear(64, 1)
+    )
+  },
+  forward = function(x) {
+    self$model(x)$squeeze(2)
+  }
+)
+```
+
+
+```{r RMSE}
+# RMSE calculator 
+compute_rmse <- function(pred_log, true_log) {
+  diff <- pred_log - true_log
+  if (torch_isnan(diff)$any()$item() || torch_isinf(diff)$any()$item()) {
+    return(Inf)
+  }
+  torch_sqrt(torch_mean(diff^2))$item()
+}
+```
+
+```{r training}
+train_loss_history <- c()
+test_loss_history <- c()
+rmse_history <- c()
+
+# Training loop
+train_mlp <- function() {
+  train_ds <- MLPDataset(X_train, y_train)
+  test_ds  <- MLPDataset(X_test, y_test)
+
+  # load the data (store some as global variables so we can access it outside the function)
+  train_dl <- dataloader(train_ds, batch_size = 32, shuffle = TRUE)
+  test_dl  <<- dataloader(test_ds, batch_size = 32)
+
+  # init the model
+  model <<- MLPModel(ncol(X_train))
+
+  optimizer <- optim_adam(model$parameters, lr = 1e-3)
+  loss_fn <- nn_mse_loss()
+  
+  for (epoch in 1:20) {
+    model$train()
+    train_loss <- 0 # keep track of training loss
+    train_rmse <- 0 # keep track of training rmse
+
+    # Coro library makes it easy to do training loops
+    coro::loop(for (b in train_dl) {
+      optimizer$zero_grad()
+      pred <- model(b$x)
+      loss <- loss_fn(pred, b$y)
+      loss$backward()
+      optimizer$step()
+      train_loss <- train_loss + loss$item() * b$x$size(1)
+      train_rmse <- train_rmse + compute_rmse(pred, b$y) * b$x$size(1)
+    })
+
+    # evaluate the model and apply it to testing set
+    model$eval()
+    test_loss <- 0
+    test_rmse <- 0
+    coro::loop(for (b in test_dl) {
+      pred <- model(b$x)
+      loss <- loss_fn(pred, b$y)
+      test_loss <- test_loss + loss$item() * b$x$size(1)
+      test_rmse <- test_rmse + compute_rmse(pred, b$y) * b$x$size(1)
+    })
+
+    cat(sprintf("Epoch %d:\n", epoch))
+    cat(sprintf("  Train Loss: %.4f | RMSE: %.2f\n", train_loss / length(train_ds), train_rmse / length(train_ds)))
+    cat(sprintf("  Test  Loss: %.4f | RMSE: %.2f\n\n", test_loss / length(test_ds), test_rmse / length(test_ds)))
+    
+    train_loss_history <<- c(train_loss_history, train_loss / length(train_ds))
+    test_loss_history <<- c(test_loss_history, test_loss / length(test_ds))
+    rmse_history <<- c(rmse_history, test_rmse / length(test_ds))
+  }
+}
+
+train_mlp()
+
+print(train_loss_history)
+```
+
+```{r plotting}
+plot_training_curves <- function(train_loss, test_loss, rmse) {
+  epochs <- seq_along(train_loss)
+  df <- tibble(
+    epoch = epochs,
+    train_loss = train_loss,
+    test_loss = test_loss,
+    rmse = rmse
+  )
+
+  p1 <- ggplot(df, aes(x = epoch)) +
+    geom_line(aes(y = train_loss, color = "Train Loss")) +
+    geom_line(aes(y = test_loss, color = "Test Loss")) +
+    labs(title = "Loss over Epochs", y = "MSE Loss", color = "") +
+    theme_minimal()
+
+  p2 <- ggplot(df, aes(x = epoch, y = rmse)) +
+    geom_line(color = "darkgreen") +
+    labs(title = "Test RMSE over Epochs", y = "RMSE") +
+    theme_minimal()
+
+  print(p1)
+  print(p2)
+}
+
+plot_training_curves(train_loss_history, test_loss_history, rmse_history)
+```
+
+
+
+```{r testing}
+collect_predictions <- function(model, test_dl) {
+  model$eval()
+
+  all_preds <- c()
+  all_true <- c()
+
+  coro::loop(for (b in test_dl) {
+    pred <- model(b$x)
+    all_preds <- c(all_preds, as.numeric(pred))
+    all_true <- c(all_true, as.numeric(b$y))
+  })
+
+  tibble(pred = all_preds, true = all_true)
+}
+```
+
+
+```{r correlation}
+test_results <- collect_predictions(model, test_dl)
+
+# Pearson correlation in log-space
+log_corr <- cor(test_results$pred, test_results$true)
+
+# Correlation in original viewCount space
+test_results <- test_results %>%
+  mutate(pred_views = expm1(pred),
+         true_views = expm1(true))
+
+viewcount_corr <- cor(test_results$pred_views, test_results$true_views)
+
+cat(sprintf("Log-scale correlation: %.4f\n", log_corr))
+cat(sprintf("Linear-scale correlation: %.4f\n", viewcount_corr))
+```
+
+
+
